@@ -23,9 +23,9 @@ except Exception:
 
 # Connect to Milvus server (change host/port if needed)
 connections.connect(
-    uri='https://admin:V2BXxbOY3E2g@ibm-lh-lakehouse-milvus536.milvus.apps.enginecluster-aurora-3.cp.fyre.ibm.com:443',
+    uri='https://admin:password@ibm-lh-lakehouse-milvus536.milvus.apps.enginecluster-aurora-3.cp.fyre.ibm.com:443',
     user='admin',
-    password='V2BXxbOY3E2g',
+    password='password',
     server_pem_path='/root/hello_milvus/aurora3.crt',
 )
 

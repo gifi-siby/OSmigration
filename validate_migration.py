@@ -80,7 +80,8 @@ def sanitize_index_name(name: str) -> str:
     return name[:255]
 
 
-def detect_vector_field(fields: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[int], Optional[DataType]]:
+def detect_vector_fields(fields: List[Dict[str, Any]]) -> List[Tuple[str, Optional[int], DataType]]:
+    vectors: List[Tuple[str, Optional[int], DataType]] = []
     for f in fields:
         dtype = f.get("type")
         if dtype in (DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR):
@@ -90,8 +91,8 @@ def detect_vector_field(fields: List[Dict[str, Any]]) -> Tuple[Optional[str], Op
                 dim = int(dim) if dim is not None else None
             except Exception:
                 dim = None
-            return f.get("name"), dim, dtype
-    return None, None, None
+            vectors.append((f.get("name"), dim, dtype))
+    return vectors
 
 
 def detect_primary_key_field(fields: List[Dict[str, Any]]) -> Optional[str]:
@@ -106,6 +107,36 @@ def l2_normalize(vec: List[float]) -> List[float]:
     if norm == 0.0:
         return vec
     return [float(x) / norm for x in vec]
+
+
+def _binary_bytes_to_bit_floats(value: Any, expected_dim: Optional[int]) -> Optional[List[float]]:
+    b: Optional[bytes] = None
+    if isinstance(value, (bytes, bytearray)):
+        b = bytes(value)
+    elif hasattr(value, "tobytes"):
+        try:
+            b = value.tobytes()
+        except Exception:
+            b = None
+    elif isinstance(value, (list, tuple)):
+        try:
+            b = bytes(value)
+        except Exception:
+            b = None
+    if b is None:
+        return None
+
+    bits: List[float] = []
+    for by in b:
+        for i in range(7, -1, -1):
+            bits.append(float((by >> i) & 1))
+    if expected_dim is not None:
+        d = int(expected_dim)
+        if len(bits) < d:
+            bits.extend([0.0] * (d - len(bits)))
+        elif len(bits) > d:
+            bits = bits[:d]
+    return bits
 
 
 # -----------------------------
@@ -127,7 +158,9 @@ def get_opensearch_doc_by_id(os_client: OpenSearch, index: str, _id: str) -> Opt
 
 def run_milvus_search(milvus_client: MilvusClient, coll_name: str, vector_field: str, query_vec: List[float], k: int,
                        pk_field: Optional[str], metric: str, milvus_search_params: Optional[Dict[str, Any]]) -> List[str]:
-    params = milvus_search_params or {"metric_type": metric.upper()}
+    params = dict(milvus_search_params or {})
+    if "metric_type" not in (params or {}):
+        params["metric_type"] = metric.upper()
     try:
         res = milvus_client.search(
             collection_name=coll_name,
@@ -136,14 +169,13 @@ def run_milvus_search(milvus_client: MilvusClient, coll_name: str, vector_field:
             output_fields=[pk_field] if pk_field else [],
             search_params=params,
         )
-        # res is typically a list (per query) of hits; each hit is a dict containing output_fields
         hits: List[Dict[str, Any]] = []
         if isinstance(res, list) and res:
             first = res[0]
             if isinstance(first, list):
                 hits = first
             elif isinstance(first, dict):
-                hits = res  # single list of dicts
+                hits = res
         ids: List[str] = []
         for h in hits:
             if isinstance(h, dict):
@@ -160,13 +192,9 @@ def run_milvus_search(milvus_client: MilvusClient, coll_name: str, vector_field:
 def run_opensearch_knn(os_client: OpenSearch, index: str, vector_field: str, query_vec: List[float], k: int, num_candidates: int) -> List[str]:
     vec = [float(x) for x in query_vec]
     bodies: List[Dict[str, Any]] = [
-        # New style with num_candidates
         {"size": int(k), "query": {"knn": {vector_field: {"vector": vec, "k": int(k), "num_candidates": int(num_candidates)}}}},
-        # New style without num_candidates
         {"size": int(k), "query": {"knn": {vector_field: {"vector": vec, "k": int(k)}}}},
-        # Legacy style with num_candidates
         {"size": int(k), "query": {"knn": {"field": vector_field, "query_vector": vec, "k": int(k), "num_candidates": int(num_candidates)}}},
-        # Legacy style without num_candidates
         {"size": int(k), "query": {"knn": {"field": vector_field, "query_vector": vec, "k": int(k)}}},
     ]
     last_err: Optional[Exception] = None
@@ -208,9 +236,9 @@ def validate_collection(milvus_client: MilvusClient, os_client: OpenSearch,
     try:
         desc = milvus_client.describe_collection(collection_name=coll_name)
         fields = desc.get("fields", [])
-        vector_field, vec_dim, vec_dtype = detect_vector_field(fields)
+        vector_fields = detect_vector_fields(fields)
         pk_field = detect_primary_key_field(fields)
-        logger.info("[%s] vector_field=%s dim=%s pk=%s", coll_name, vector_field, vec_dim, pk_field)
+        logger.info("[%s] vector_fields=%s pk=%s", coll_name, [(n, d, int(dt)) for (n, d, dt) in vector_fields], pk_field)
     except Exception as e:
         logger.error("[%s] Failed to describe collection: %s", coll_name, e)
         return False
@@ -264,55 +292,67 @@ def validate_collection(milvus_client: MilvusClient, os_client: OpenSearch,
         if by_id_ok:
             logger.info("[%s] Sample documents matched successfully by _id.", coll_name)
 
-    # Optional: search validation
+    # Optional: search validation per vector field
     search_ok = True
-    if do_search_validation and milvus_docs and vector_field and vec_dim and os_count > 0 and milvus_count > 0:
-        queries_used = 0
-        recalls: List[float] = []
-        top1s: List[float] = []
-        for doc in milvus_docs:
-            if queries_used >= search_queries:
-                break
-            if vector_field not in doc:
+    if do_search_validation and milvus_docs and os_count > 0 and milvus_count > 0 and vector_fields:
+        for (field_name, vec_dim, vec_dtype) in vector_fields:
+            if vec_dim is None:
+                logger.warning("[%s] Skipping field '%s' due to unknown dimension", coll_name, field_name)
                 continue
-            query_vec = doc[vector_field]
-            # Ensure vector is a list of floats
-            if hasattr(query_vec, "tolist"):
-                try:
-                    query_vec = query_vec.tolist()
-                except Exception:
+            field_metric = "HAMMING" if vec_dtype == DataType.BINARY_VECTOR else metric.upper()
+            queries_used = 0
+            recalls: List[float] = []
+            top1s: List[float] = []
+            for doc in milvus_docs:
+                if queries_used >= search_queries:
+                    break
+                if field_name not in doc:
                     continue
-            try:
-                qv = [float(x.item() if hasattr(x, "item") else x) for x in (query_vec or [])]
-            except Exception:
-                continue
-            if len(qv) != int(vec_dim):
-                continue
-            if normalize_cosine and metric.lower() == "cosine":
-                qv = l2_normalize(qv)
+                qv = doc[field_name]
+                # Prepare query vector
+                if vec_dtype == DataType.FLOAT_VECTOR:
+                    if hasattr(qv, "tolist"):
+                        try:
+                            qv = qv.tolist()
+                        except Exception:
+                            continue
+                    try:
+                        qv = [float(x.item() if hasattr(x, "item") else x) for x in (qv or [])]
+                    except Exception:
+                        continue
+                    if len(qv) != int(vec_dim):
+                        continue
+                    if normalize_cosine and field_metric == "COSINE":
+                        qv = l2_normalize(qv)
+                else:
+                    # binary
+                    qv = _binary_bytes_to_bit_floats(qv, vec_dim)
+                    if qv is None or len(qv) != int(vec_dim):
+                        continue
 
-            # Milvus search
-            milvus_ids = run_milvus_search(milvus_client, coll_name, vector_field, qv, search_k, pk_field, metric, milvus_search_params)
-            # OpenSearch knn
-            os_ids = run_opensearch_knn(os_client, os_index, vector_field, qv, search_k, os_num_candidates)
+                # Milvus search
+                milvus_ids = run_milvus_search(milvus_client, coll_name, field_name, qv, search_k, pk_field, field_metric, milvus_search_params)
+                # OpenSearch knn
+                os_ids = run_opensearch_knn(os_client, os_index, field_name, qv, search_k, os_num_candidates)
 
-            if milvus_ids and os_ids:
-                recall_k, top1 = compare_rankings(milvus_ids, os_ids, search_k)
-                recalls.append(recall_k)
-                top1s.append(top1)
-                queries_used += 1
+                if milvus_ids and os_ids:
+                    recall_k, top1 = compare_rankings(milvus_ids, os_ids, search_k)
+                    recalls.append(recall_k)
+                    top1s.append(top1)
+                    queries_used += 1
 
-        if queries_used == 0:
-            logger.warning("[%s] No valid query vectors available for search validation.", coll_name)
-            search_ok = False
-        else:
-            avg_recall = sum(recalls) / len(recalls) if recalls else 0.0
-            avg_top1 = sum(top1s) / len(top1s) if top1s else 0.0
-            logger.info("[%s] Search validation over %d queries: avg recall@%d=%.3f, top1=%.3f", coll_name, queries_used, search_k, avg_recall, avg_top1)
-            # Thresholds can be tuned; for production, expect high recall
-            if avg_recall < 0.9:
-                logger.warning("[%s] Low recall@%d: %.3f", coll_name, search_k, avg_recall)
+            if queries_used == 0:
+                logger.warning("[%s] Field '%s': No valid query vectors available for search validation.", coll_name, field_name)
                 search_ok = False
+            else:
+                avg_recall = sum(recalls) / len(recalls) if recalls else 0.0
+                avg_top1 = sum(top1s) / len(top1s) if top1s else 0.0
+                logger.info("[%s] Field '%s' (%s) search validation over %d queries: avg recall@%d=%.3f, top1=%.3f",
+                            coll_name, field_name, ("BINARY" if vec_dtype == DataType.BINARY_VECTOR else "FLOAT"),
+                            queries_used, search_k, avg_recall, avg_top1)
+                if avg_recall < 0.9:
+                    logger.warning("[%s] Field '%s': Low recall@%d: %.3f", coll_name, field_name, search_k, avg_recall)
+                    search_ok = False
 
     return by_id_ok and (not do_search_validation or search_ok) and (milvus_count == os_count)
 

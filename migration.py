@@ -64,21 +64,20 @@ def sanitize_index_name(name: str) -> str:
     return name[:255]
 
 
-def detect_vector_field(fields: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[int], Optional[DataType]]:
-    """Detect vector field name, dimension, and dtype (FLOAT_VECTOR/BINARY_VECTOR)."""
+def detect_vector_fields(fields: List[Dict[str, Any]]) -> List[Tuple[str, Optional[int], DataType]]:
+    """Detect all vector fields: list of (name, dim, dtype)."""
+    vectors: List[Tuple[str, Optional[int], DataType]] = []
     for f in fields:
         dtype = f.get("type")
         if dtype in (DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR):
             params = f.get("params", {}) or {}
             dim = params.get("dim") or params.get("dimension")
-            if dim is None:
-                return f.get("name"), None, dtype
             try:
-                dim = int(dim)
+                dim = int(dim) if dim is not None else None
             except Exception:
                 dim = None
-            return f.get("name"), dim, dtype
-    return None, None, None
+            vectors.append((f.get("name"), dim, dtype))
+    return vectors
 
 
 def detect_primary_key_field(fields: List[Dict[str, Any]]) -> Optional[str]:
@@ -90,15 +89,14 @@ def detect_primary_key_field(fields: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
-def build_index_mapping(vector_field: str, vector_dim: int, vector_dtype: DataType,
+def build_index_mapping(vector_fields: List[Tuple[str, Optional[int], DataType]],
                         fields: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Build an OpenSearch index mapping for the collection."""
-    if vector_dtype == DataType.BINARY_VECTOR:
-        # OpenSearch typically supports float vectors in knn_vector; binary support varies by version.
-        # To avoid incorrect indexing, explicitly raise for binary vectors.
-        raise ValueError("BINARY_VECTOR fields are not supported by this script.")
+    """Build an OpenSearch index mapping including all vector fields.
 
-    # Base mapping with knn enabled
+    - FLOAT_VECTOR and BINARY_VECTOR fields are mapped as knn_vector with their bit/float dimension.
+    - BINARY vectors will be ingested as 0/1 float vectors to preserve Hamming ranking via L2.
+    - Scalars are mapped explicitly where known; strings via dynamic templates.
+    """
     mapping: Dict[str, Any] = {
         "settings": {
             "index": {
@@ -116,19 +114,26 @@ def build_index_mapping(vector_field: str, vector_dim: int, vector_dtype: DataTy
                         "match_mapping_type": "string",
                         "mapping": {
                             "type": "text",
-                            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}
-                        }
+                            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+                        },
                     }
                 }
             ],
-            "properties": {
-                vector_field: {
-                    "type": "knn_vector",
-                    "dimension": int(vector_dim),
-                }
-            }
-        }
+            "properties": {},
+        },
     }
+
+    vector_names = set()
+    for name, dim, dtype in vector_fields:
+        if not name:
+            continue
+        if dim is None or int(dim) <= 0:
+            raise ValueError(f"Missing/invalid dimension for vector field '{name}'")
+        vector_names.add(name)
+        mapping["mappings"]["properties"][name] = {
+            "type": "knn_vector",
+            "dimension": int(dim),
+        }
 
     # Explicitly map non-string numeric/boolean types when known.
     milvus_to_os_type = {
@@ -139,20 +144,17 @@ def build_index_mapping(vector_field: str, vector_dim: int, vector_dtype: DataTy
         DataType.INT64: "long",
         DataType.FLOAT: "float",
         DataType.DOUBLE: "double",
-        # Strings handled by dynamic_templates
-        # DataType.VARCHAR: text/keyword via dynamic template
-        # DataType.STRING: text/keyword via dynamic template
+        # Strings handled by dynamic_templates (VARCHAR/STRING)
     }
 
     for f in fields:
         name = f.get("name")
         dtype = f.get("type")
-        if not name or name == vector_field:
+        if not name or name in vector_names:
             continue
         os_type = milvus_to_os_type.get(dtype)
         if os_type:
             mapping["mappings"]["properties"][name] = {"type": os_type}
-        # else let dynamic mappings handle it
 
     return mapping
 
@@ -205,14 +207,55 @@ def _convert_vector(value: Any, expected_dim: Optional[int]) -> Optional[List[fl
     return None
 
 
-def doc_to_source(doc: Dict[str, Any], vector_field: Optional[str] = None, vec_dim: Optional[int] = None) -> Optional[Dict[str, Any]]:
+def _binary_bytes_to_bit_floats(value: Any, expected_dim: Optional[int]) -> Optional[List[float]]:
+    """Convert Milvus binary vector representation to 0/1 float list of length expected_dim.
+
+    Accepts bytes/bytearray or sequences convertible to bytes. Uses big-endian bit order.
+    """
+    b: Optional[bytes] = None
+    if isinstance(value, (bytes, bytearray)):
+        b = bytes(value)
+    elif hasattr(value, "tobytes"):
+        try:
+            b = value.tobytes()
+        except Exception:
+            b = None
+    elif isinstance(value, (list, tuple)):
+        try:
+            b = bytes(value)
+        except Exception:
+            b = None
+    if b is None:
+        return None
+
+    bits: List[float] = []
+    for by in b:
+        for i in range(7, -1, -1):
+            bits.append(float((by >> i) & 1))
+    if expected_dim is not None:
+        d = int(expected_dim)
+        if len(bits) < d:
+            bits.extend([0.0] * (d - len(bits)))
+        elif len(bits) > d:
+            bits = bits[:d]
+    return bits
+
+
+def doc_to_source(doc: Dict[str, Any], vector_fields: List[Tuple[str, Optional[int], DataType]]) -> Optional[Dict[str, Any]]:
     result: Dict[str, Any] = {}
+    float_dims = {name: dim for name, dim, dt in vector_fields if dt == DataType.FLOAT_VECTOR and name}
+    binary_dims = {name: dim for name, dim, dt in vector_fields if dt == DataType.BINARY_VECTOR and name}
     for k, v in doc.items():
-        if vector_field and k == vector_field:
-            vec = _convert_vector(v, vec_dim)
+        if k in float_dims:
+            vec = _convert_vector(v, float_dims[k])
             if vec is None:
                 return None
             result[k] = vec
+        elif k in binary_dims:
+            vecb = _binary_bytes_to_bit_floats(v, binary_dims[k])
+            if vecb is None:
+                return None
+            result[k] = vecb
         else:
             result[k] = make_serializable(v)
     return result
@@ -334,19 +377,19 @@ def migrate_all_collections(milvus_cfg: Dict[str, Any], os_cfg: Dict[str, Any],
                 desc = milvus_client.describe_collection(collection_name=coll_name)
                 fields = desc.get("fields", [])
 
-                vector_field, vec_dim, vec_dtype = detect_vector_field(fields)
-                if not vector_field:
-                    logger.warning("[%s.%s] No vector field found—skipping.", db_name, coll_name)
-                    continue
-                if vec_dim is None or vec_dim <= 0:
-                    logger.error("[%s.%s] Vector dimension missing/invalid—skipping.", db_name, coll_name)
-                    continue
-                if vec_dtype == DataType.BINARY_VECTOR:
-                    logger.error("[%s.%s] BINARY_VECTOR not supported by this script—skipping.", db_name, coll_name)
+                vector_fields = detect_vector_fields(fields)
+                if not vector_fields:
+                    logger.warning("[%s.%s] No vector fields found—skipping.", db_name, coll_name)
                     continue
 
                 pk_field = detect_primary_key_field(fields)
-                logger.info("[%s.%s] Vector field '%s' (dim=%d); PK field: %s", db_name, coll_name, vector_field, vec_dim, pk_field)
+                logger.info("[%s.%s] Detected %d vector field(s); PK field: %s", db_name, coll_name, len(vector_fields), pk_field)
+
+                # Ensure the collection is loaded before querying
+                try:
+                    milvus_client.load_collection(collection_name=coll_name)
+                except Exception as e:
+                    logger.debug("[%s.%s] load_collection ignored: %s", db_name, coll_name, e)
 
                 # Probe for data presence
                 try:
@@ -371,7 +414,7 @@ def migrate_all_collections(milvus_cfg: Dict[str, Any], os_cfg: Dict[str, Any],
                 os_index = sanitize_index_name(f"{os_index_prefix}_{coll_name}")
 
             try:
-                mapping = build_index_mapping(vector_field, vec_dim, vec_dtype, fields)
+                mapping = build_index_mapping(vector_fields, fields)
             except Exception as e:
                 logger.error("[%s.%s] Mapping build failed: %s", db_name, coll_name, e)
                 continue
@@ -420,8 +463,18 @@ def migrate_all_collections(milvus_cfg: Dict[str, Any], os_cfg: Dict[str, Any],
 
             # Adjust batch size for very high-dimensional vectors
             effective_batch_size = int(milvus_cfg.get("batch_size", batch_size))
-            if vec_dim > 512 and effective_batch_size > 200:
+            try:
+                max_dim = max(int(d or 0) for _, d, _ in vector_fields)
+            except Exception:
+                max_dim = 0
+            if max_dim > 512 and effective_batch_size > 200:
                 effective_batch_size = 200
+
+            # Ensure the collection is loaded before creating iterator
+            try:
+                milvus_client.load_collection(collection_name=coll_name)
+            except Exception as e:
+                logger.debug("[%s.%s] load_collection before iterator ignored: %s", db_name, coll_name, e)
 
             try:
                 iterator = milvus_client.query_iterator(
@@ -453,9 +506,9 @@ def migrate_all_collections(milvus_cfg: Dict[str, Any], os_cfg: Dict[str, Any],
 
                     actions = []
                     for doc in batch:
-                        src = doc_to_source(doc, vector_field, vec_dim)
+                        src = doc_to_source(doc, vector_fields)
                         if src is None:
-                            logger.warning("[%s.%s] Skipping doc due to non-serializable or invalid vector (dim mismatch)", db_name, coll_name)
+                            logger.warning("[%s.%s] Skipping doc due to non-serializable or invalid vector field(s)", db_name, coll_name)
                             continue
                         action: Dict[str, Any] = {
                             "_index": os_index,
@@ -555,7 +608,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--os-verify-certs", action="store_true", default=os.getenv("OS_VERIFY_CERTS", "false").lower() == "true")
     p.add_argument("--os-ca-certs", default=os.getenv("OS_CA_CERTS"))
     p.add_argument("--os-timeout", type=int, default=int(os.getenv("OS_TIMEOUT", "120")))
-    p.add_argument("--os-max-retries", type:int, default=int(os.getenv("OS_MAX_RETRIES", "3")))
+    p.add_argument("--os-max-retries", type=int, default=int(os.getenv("OS_MAX_RETRIES", "3")))
     p.add_argument("--os-bulk-timeout", type=int, default=int(os.getenv("OS_BULK_TIMEOUT", "300")))
 
     # General

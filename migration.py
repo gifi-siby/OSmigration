@@ -69,7 +69,7 @@ def detect_vector_fields(fields: List[Dict[str, Any]]) -> List[Tuple[str, Option
     vectors: List[Tuple[str, Optional[int], DataType]] = []
     for f in fields:
         dtype = f.get("type")
-        if dtype in (DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR):
+        if dtype in (DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR, DataType.BINARY_VECTOR):
             params = f.get("params", {}) or {}
             dim = params.get("dim") or params.get("dimension")
             try:
@@ -130,10 +130,16 @@ def build_index_mapping(vector_fields: List[Tuple[str, Optional[int], DataType]]
         if dim is None or int(dim) <= 0:
             raise ValueError(f"Missing/invalid dimension for vector field '{name}'")
         vector_names.add(name)
-        mapping["mappings"]["properties"][name] = {
-            "type": "knn_vector",
-            "dimension": int(dim),
-        }
+        if dtype in (
+            DataType.FLOAT_VECTOR,
+            DataType.FLOAT16_VECTOR,
+            DataType.BFLOAT16_VECTOR,
+            DataType.BINARY_VECTOR,
+        ):
+            mapping["mappings"]["properties"][name] = {
+                "type": "knn_vector",
+                "dimension": int(dim),
+            }
 
     # Explicitly map non-string numeric/boolean types when known.
     milvus_to_os_type = {
@@ -145,6 +151,8 @@ def build_index_mapping(vector_fields: List[Tuple[str, Optional[int], DataType]]
         DataType.FLOAT: "float",
         DataType.DOUBLE: "double",
         # Strings handled by dynamic_templates (VARCHAR/STRING)
+        DataType.ARRAY: "array",
+        DataType.JSON: "object",
     }
 
     for f in fields:
@@ -152,10 +160,17 @@ def build_index_mapping(vector_fields: List[Tuple[str, Optional[int], DataType]]
         dtype = f.get("type")
         if not name or name in vector_names:
             continue
-        os_type = milvus_to_os_type.get(dtype)
-        if os_type:
-            mapping["mappings"]["properties"][name] = {"type": os_type}
-
+        if dtype == DataType.ARRAY:
+            # Get element type from params
+            elem_type = f.get("params", {}).get("element_type")
+            os_elem_type = milvus_to_os_type.get(elem_type)
+            if os_elem_type:
+                mapping["mappings"]["properties"][name] = {"type": os_elem_type}
+            # OpenSearch will accept arrays of this type
+        else:
+            os_type = milvus_to_os_type.get(dtype)
+            if os_type:
+                mapping["mappings"]["properties"][name] = {"type": os_type}
     return mapping
 
 
@@ -243,7 +258,7 @@ def _binary_bytes_to_bit_floats(value: Any, expected_dim: Optional[int]) -> Opti
 
 def doc_to_source(doc: Dict[str, Any], vector_fields: List[Tuple[str, Optional[int], DataType]]) -> Optional[Dict[str, Any]]:
     result: Dict[str, Any] = {}
-    float_dims = {name: dim for name, dim, dt in vector_fields if dt == DataType.FLOAT_VECTOR and name}
+    float_dims = {name: dim for name, dim, dt in vector_fields if dt in (DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR) and name}
     binary_dims = {name: dim for name, dim, dt in vector_fields if dt == DataType.BINARY_VECTOR and name}
     for k, v in doc.items():
         if k in float_dims:
@@ -321,18 +336,18 @@ def migrate_all_collections(milvus_cfg: Dict[str, Any], os_cfg: Dict[str, Any],
                             errors_dir: Optional[str] = None) -> None:
     logger.info("Connecting to Milvus...")
     try:
-        # Create a temporary client to discover databases
-        temp_client = MilvusClient(
-            uri=milvus_cfg["uri"],
-            user=milvus_cfg.get("user"),
-            password=milvus_cfg.get("password"),
-            db_name=milvus_cfg.get("db", "default"),
-            secure=bool(milvus_cfg.get("secure", False)),
-            server_pem_path=milvus_cfg.get("pem_path"),
-            server_name=milvus_cfg.get("server"),
-        )
         configured_db = (milvus_cfg.get("db") or "default")
         if isinstance(configured_db, str) and configured_db.lower() == "all":
+            # Create a temporary client to discover databases
+            temp_client = MilvusClient(
+                uri=milvus_cfg["uri"],
+                user=milvus_cfg.get("user"),
+                password=milvus_cfg.get("password"),
+                db_name="default",
+                secure=bool(milvus_cfg.get("secure", True)),
+                server_pem_path=milvus_cfg.get("pem_path"),
+                server_name=milvus_cfg.get("server"),
+            )
             databases = list_all_databases_with_fallback(temp_client)
         else:
             databases = [configured_db]

@@ -84,7 +84,13 @@ def detect_vector_fields(fields: List[Dict[str, Any]]) -> List[Tuple[str, Option
     vectors: List[Tuple[str, Optional[int], DataType]] = []
     for f in fields:
         dtype = f.get("type")
-        if dtype in (DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR):
+        if dtype in (
+            DataType.FLOAT_VECTOR,
+            DataType.FLOAT16_VECTOR,
+            DataType.BFLOAT16_VECTOR,
+            DataType.BINARY_VECTOR,
+            # DataType.SPARSE_FLOAT_VECTOR,
+        ):
             params = f.get("params", {}) or {}
             dim = params.get("dim") or params.get("dimension")
             try:
@@ -137,6 +143,49 @@ def _binary_bytes_to_bit_floats(value: Any, expected_dim: Optional[int]) -> Opti
         elif len(bits) > d:
             bits = bits[:d]
     return bits
+
+
+def prepare_query_vector(qv, vec_dtype, vec_dim):
+    if vec_dtype in (DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR):
+        if hasattr(qv, "tolist"):
+            try:
+                qv = qv.tolist()
+            except Exception:
+                return None
+        try:
+            qv = [float(x.item() if hasattr(x, "item") else x) for x in (qv or [])]
+        except Exception:
+            return None
+        if len(qv) != int(vec_dim):
+            return None
+        return qv
+    elif vec_dtype == DataType.BINARY_VECTOR:
+        qv = _binary_bytes_to_bit_floats(qv, vec_dim)
+        if qv is None or len(qv) != int(vec_dim):
+            return None
+        return qv
+    elif vec_dtype == DataType.SPARSE_FLOAT_VECTOR:
+        # Convert sparse to dense if possible, or skip if not supported by OpenSearch
+        # Example: {key: value, ...} to dense list
+        # You need to know the full dimension and fill missing keys with 0.0
+        dense = [0.0] * int(vec_dim)
+        if isinstance(qv, dict):
+            for k, v in qv.items():
+                idx = int(k)
+                if 0 <= idx < int(vec_dim):
+                    dense[idx] = float(v)
+            return dense
+        elif isinstance(qv, list):
+            # If already a list of (key, value) pairs
+            for pair in qv:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    idx, val = pair
+                    idx = int(idx)
+                    if 0 <= idx < int(vec_dim):
+                        dense[idx] = float(val)
+            return dense
+        return None
+    return None
 
 
 # -----------------------------
@@ -218,6 +267,15 @@ def compare_rankings(milvus_ids: List[str], os_ids: List[str], k: int) -> Tuple[
     recall_at_k = inter / float(k)
     top1 = 1.0 if (milvus_ids[0] == os_ids[0] if milvus_ids and os_ids else False) else 0.0
     return recall_at_k, top1
+
+
+def compare_documents(milvus_doc, os_doc, fields):
+    for f in fields:
+        name = f.get("name")
+        if name in milvus_doc and name in os_doc:
+            if milvus_doc[name] != os_doc[name]:
+                return False
+    return True
 
 
 def validate_collection(milvus_client: MilvusClient, os_client: OpenSearch,
@@ -308,28 +366,11 @@ def validate_collection(milvus_client: MilvusClient, os_client: OpenSearch,
                     break
                 if field_name not in doc:
                     continue
-                qv = doc[field_name]
-                # Prepare query vector
-                if vec_dtype == DataType.FLOAT_VECTOR:
-                    if hasattr(qv, "tolist"):
-                        try:
-                            qv = qv.tolist()
-                        except Exception:
-                            continue
-                    try:
-                        qv = [float(x.item() if hasattr(x, "item") else x) for x in (qv or [])]
-                    except Exception:
-                        continue
-                    if len(qv) != int(vec_dim):
-                        continue
-                    if normalize_cosine and field_metric == "COSINE":
-                        qv = l2_normalize(qv)
-                else:
-                    # binary
-                    qv = _binary_bytes_to_bit_floats(qv, vec_dim)
-                    if qv is None or len(qv) != int(vec_dim):
-                        continue
-
+                qv = prepare_query_vector(doc[field_name], vec_dtype, vec_dim)
+                if qv is None:
+                    continue
+                if normalize_cosine and field_metric == "COSINE":
+                    qv = l2_normalize(qv)
                 # Milvus search
                 milvus_ids = run_milvus_search(milvus_client, coll_name, field_name, qv, search_k, pk_field, field_metric, milvus_search_params)
                 # OpenSearch knn
@@ -374,15 +415,29 @@ def validate_all(milvus_cfg: Dict[str, Any], os_cfg: Dict[str, Any], os_index_pr
 
     # Milvus connect with retries
     try:
-        milvus_client = MilvusClient(
-            uri=milvus_cfg["uri"],
-            user=milvus_cfg.get("user"),
-            password=milvus_cfg.get("password"),
-            db_name=milvus_cfg.get("db", "default"),
-            secure=bool(milvus_cfg.get("secure", False)),
-            server_pem_path=milvus_cfg.get("pem_path"),
-            server_name=milvus_cfg.get("server"),
-        )
+        configured_db = milvus_cfg.get("db", "default")
+        if isinstance(configured_db, str) and configured_db.lower() == "all":
+            milvus_client = MilvusClient(
+                uri=milvus_cfg["uri"],
+                user=milvus_cfg.get("user"),
+                password=milvus_cfg.get("password"),
+                db_name="default", 
+                secure=bool(milvus_cfg.get("secure", False)),
+                server_pem_path=milvus_cfg.get("pem_path"),
+                server_name=milvus_cfg.get("server"),
+            )
+            databases = milvus_client.list_databases()
+        else:
+            milvus_client = MilvusClient(
+                uri=milvus_cfg["uri"],
+                user=milvus_cfg.get("user"),
+                password=milvus_cfg.get("password"),
+                db_name=configured_db,
+                secure=bool(milvus_cfg.get("secure", False)),
+                server_pem_path=milvus_cfg.get("pem_path"),
+                server_name=milvus_cfg.get("server"),
+            )
+            databases = [configured_db]
         retries = int(milvus_cfg.get("connect_retries", 5))
         backoff = int(milvus_cfg.get("connect_backoff_sec", 3))
         for attempt in range(1, retries + 1):

@@ -5,6 +5,7 @@ import json
 import time
 import logging
 import argparse
+import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 
 from pymilvus import MilvusClient, DataType
@@ -123,6 +124,7 @@ def build_index_mapping(vector_fields: List[Tuple[str, Optional[int], DataType]]
         },
     }
 
+    # --- Handle vector fields ---
     vector_names = set()
     for name, dim, dtype in vector_fields:
         if not name:
@@ -141,6 +143,7 @@ def build_index_mapping(vector_fields: List[Tuple[str, Optional[int], DataType]]
                 "dimension": int(dim),
             }
 
+    # --- Scalar & structured fields ---
     # Explicitly map non-string numeric/boolean types when known.
     milvus_to_os_type = {
         DataType.BOOL: "boolean",
@@ -151,8 +154,8 @@ def build_index_mapping(vector_fields: List[Tuple[str, Optional[int], DataType]]
         DataType.FLOAT: "float",
         DataType.DOUBLE: "double",
         # Strings handled by dynamic_templates (VARCHAR/STRING)
-        DataType.ARRAY: "array",
-        DataType.JSON: "object",
+        # DataType.ARRAY: "array",
+        # DataType.JSON: "object",
     }
 
     for f in fields:
@@ -160,17 +163,28 @@ def build_index_mapping(vector_fields: List[Tuple[str, Optional[int], DataType]]
         dtype = f.get("type")
         if not name or name in vector_names:
             continue
+        # Handle ARRAY fields
         if dtype == DataType.ARRAY:
-            # Get element type from params
             elem_type = f.get("params", {}).get("element_type")
-            os_elem_type = milvus_to_os_type.get(elem_type)
+            # os_elem_type = milvus_to_os_type.get(elem_type)
+            os_elem_type = milvus_to_os_type.get(elem_type, "keyword")
             if os_elem_type:
                 mapping["mappings"]["properties"][name] = {"type": os_elem_type}
-            # OpenSearch will accept arrays of this type
+                continue
+         # Handle JSON fields
+        if dtype == DataType.JSON:
+            mapping["mappings"]["properties"][name] = {
+                "type": "object",
+                "dynamic": True,  # allows nested fields and flexible JSON
+            }
+            continue
+        # Standard scalar types
+        os_type = milvus_to_os_type.get(dtype)
+        if os_type:
+            mapping["mappings"]["properties"][name] = {"type": os_type}
         else:
-            os_type = milvus_to_os_type.get(dtype)
-            if os_type:
-                mapping["mappings"]["properties"][name] = {"type": os_type}
+            # Fallback for any unknown types
+            mapping["mappings"]["properties"][name] = {"type": "keyword"}
     return mapping
 
 
@@ -178,25 +192,68 @@ def make_serializable(value: Any) -> Any:
     """Recursively convert values to JSON-serializable forms without stringifying arrays of numbers."""
     if value is None:
         return None
-    if isinstance(value, dict):
-        return {k: make_serializable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
+    #
+    # ---- Basic numeric & bool types ----
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value)
+    # ---- Array or list-like ----
+    if isinstance(value, (list, tuple, np.ndarray)):
         return [make_serializable(v) for v in value]
+    # ---- Dictionary / JSON object ----
+    if isinstance(value, dict):
+        return {str(k): make_serializable(v) for k, v in value.items()}
+    # ---- JSON string that might contain object or array ----
+    if isinstance(value, str):
+        stripped = value.strip()
+        if (stripped.startswith("{") and stripped.endswith("}")) or \
+           (stripped.startswith("[") and stripped.endswith("]")):
+            try:
+                parsed = json.loads(value)
+                return make_serializable(parsed)
+            except Exception:
+                pass
+        return value
+    # ---- Handle numpy or other objects with conversion helpers ----
+    if hasattr(value, "tolist"):
+        try:
+            return make_serializable(value.tolist())
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            return make_serializable(value.item())
+        except Exception:
+            pass
+    # ---- Last resort: try JSON encoding or fallback to str ----
     try:
         json.dumps(value)
         return value
     except TypeError:
-        if hasattr(value, "tolist"):
-            try:
-                return make_serializable(value.tolist())
-            except Exception:
-                pass
-        if hasattr(value, "item"):
-            try:
-                return value.item()
-            except Exception:
-                pass
         return str(value)
+    #
+    # if isinstance(value, dict):
+    #     return {k: make_serializable(v) for k, v in value.items()}
+    # if isinstance(value, (list, tuple)):
+    #     return [make_serializable(v) for v in value]
+    # try:
+    #     json.dumps(value)
+    #     return value
+    # except TypeError:
+    #     if hasattr(value, "tolist"):
+    #         try:
+    #             return make_serializable(value.tolist())
+    #         except Exception:
+    #             pass
+    #     if hasattr(value, "item"):
+    #         try:
+    #             return value.item()
+    #         except Exception:
+    #             pass
+    #     return str(value)
 
 
 def _convert_vector(value: Any, expected_dim: Optional[int]) -> Optional[List[float]]:

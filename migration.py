@@ -417,7 +417,7 @@ def migrate_all_collections(milvus_cfg: Dict[str, Any], os_cfg: Dict[str, Any],
 
     os_client = create_opensearch_client(os_cfg)
 
-    include_db_in_index_name = len(databases) > 1
+    include_db_in_index_name = False # len(databases) > 1 #GIFI changed to avoid db in collection name
 
     for db_name in databases:
         logger.info("Switching to database: %s", db_name)

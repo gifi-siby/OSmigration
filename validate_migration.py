@@ -357,7 +357,19 @@ def validate_collection(milvus_client: MilvusClient, os_client: OpenSearch,
             if vec_dim is None:
                 logger.warning("[%s] Skipping field '%s' due to unknown dimension", coll_name, field_name)
                 continue
-            field_metric = "HAMMING" if vec_dtype == DataType.BINARY_VECTOR else metric.upper()
+            # field_metric = "HAMMING" if vec_dtype == DataType.BINARY_VECTOR else metric.upper()
+            # GIFI
+            try:
+                indexes = milvus_client.list_indexes(coll_name)
+                if indexes:
+                    index_info = milvus_client.describe_index(coll_name, indexes[0])
+                    field_metric = index_info.get("index_param", {}).get("metric_type", metric.upper())
+                else:
+                    field_metric = "HAMMING" if vec_dtype == DataType.BINARY_VECTOR else metric.upper()
+            except Exception:
+                field_metric = "HAMMING" if vec_dtype == DataType.BINARY_VECTOR else metric.upper()
+            logger.debug("[%s] Using metric '%s' for field '%s'", coll_name, field_metric, field_name)
+
             queries_used = 0
             recalls: List[float] = []
             top1s: List[float] = []
@@ -469,6 +481,7 @@ def validate_all(milvus_cfg: Dict[str, Any], os_cfg: Dict[str, Any], os_index_pr
     all_passed = True
     for coll in collections:
         os_index = sanitize_index_name(f"{os_index_prefix}_{coll}")
+        # os_index = sanitize_index_name(f"{os_index_prefix}_{db}_{coll}") #GIFI
         logger.info("Validating collection: %s -> index: %s", coll, os_index)
         passed = validate_collection(
             milvus_client, os_client, coll, os_index,
